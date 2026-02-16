@@ -10,4 +10,5 @@ const (
 	ControlPlaneLabelKey      = "kamaji.clastix.io/name"
 	ControlPlaneLabelResource = "kamaji.clastix.io/component"
 	ControllerLabelResource   = "kamaji.clastix.io/certificate_lifecycle_controller"
+	ControlPlaneTargetCluster = "kamaji.clastix.io/target-cluster"
 )

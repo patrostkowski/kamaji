@@ -22,6 +22,9 @@ import (
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/clock"
 	ctrl "sigs.k8s.io/controller-runtime"
+	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
+	mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
+	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -47,6 +50,7 @@ import (
 
 // TenantControlPlaneReconciler reconciles a TenantControlPlane object.
 type TenantControlPlaneReconciler struct {
+	Manager 				mcmanager.Manager
 	Client                  client.Client
 	APIReader               client.Reader
 	Config                  TenantControlPlaneReconcilerConfig
@@ -88,12 +92,18 @@ type TenantControlPlaneReconcilerConfig struct {
 //+kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=tlsroutes,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways,verbs=get;list;watch
 
-func (r *TenantControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *TenantControlPlaneReconciler) Reconcile(ctx context.Context, req mcreconcile.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
 
 	var cancelFn context.CancelFunc
 	ctx, cancelFn = context.WithTimeout(ctx, r.ReconcileTimeout)
 	defer cancelFn()
+
+	cl, err := r.Manager.GetCluster(ctx, req.ClusterName)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 
 	tenantControlPlane, err := r.getTenantControlPlane(ctx, req.NamespacedName)()
 	if k8serrors.IsNotFound(err) {
@@ -292,20 +302,20 @@ func (r *TenantControlPlaneReconciler) mutexSpec(obj client.Object) mutex.Spec {
 }
 
 // SetupWithManager sets up the controller with the Manager.
-func (r *TenantControlPlaneReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager) error {
+func (r *TenantControlPlaneReconciler) SetupWithManager(ctx context.Context, mgr mcmanager.Manager) error {
 	r.clock = clock.RealClock{}
 
-	controllerBuilder := ctrl.NewControllerManagedBy(mgr).
-		WatchesRawSource(source.Channel(r.CertificateChan, handler.Funcs{GenericFunc: func(_ context.Context, genericEvent event.TypedGenericEvent[client.Object], w workqueue.TypedRateLimitingInterface[reconcile.Request]) {
-			w.AddRateLimited(ctrl.Request{
+	controllerBuilder := mcbuilder.ControllerManagedBy(mgr).
+		WatchesRawSource(source.Channel(r.CertificateChan, handler.Funcs{GenericFunc: func(_ context.Context, genericEvent event.TypedGenericEvent[client.Object], w workqueue.TypedRateLimitingInterface[mcreconcile.Request]) {
+			w.AddRateLimited(mcreconcile.Request{
 				NamespacedName: k8stypes.NamespacedName{
 					Namespace: genericEvent.Object.GetNamespace(),
 					Name:      genericEvent.Object.GetName(),
 				},
 			})
 		}})).
-		WatchesRawSource(source.Channel(r.TriggerChan, handler.Funcs{GenericFunc: func(_ context.Context, genericEvent event.TypedGenericEvent[client.Object], w workqueue.TypedRateLimitingInterface[reconcile.Request]) {
-			w.AddRateLimited(ctrl.Request{
+		WatchesRawSource(source.Channel(r.TriggerChan, handler.Funcs{GenericFunc: func(_ context.Context, genericEvent event.TypedGenericEvent[client.Object], w workqueue.TypedRateLimitingInterface[mcreconcile.Request]) {
+			w.AddRateLimited(mcreconcile.Request{
 				NamespacedName: k8stypes.NamespacedName{
 					Namespace: genericEvent.Object.GetNamespace(),
 					Name:      genericEvent.Object.GetName(),
@@ -318,7 +328,7 @@ func (r *TenantControlPlaneReconciler) SetupWithManager(ctx context.Context, mgr
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
 		Owns(&networkingv1.Ingress{}).
-		Watches(&batchv1.Job{}, handler.EnqueueRequestsFromMapFunc(func(_ context.Context, object client.Object) []reconcile.Request {
+		Watches(&batchv1.Job{}, handler.EnqueueRequestsFromMapFunc(func(_ context.Context, object client.Object) []mcreconcile.Request {
 			labels := object.GetLabels()
 
 			name, namespace := labels["tcp.kamaji.clastix.io/name"], labels["tcp.kamaji.clastix.io/namespace"]

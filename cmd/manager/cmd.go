@@ -27,6 +27,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	ctrlwebhook "sigs.k8s.io/controller-runtime/pkg/webhook"
+	"k8s.io/client-go/tools/clientcmd"
+	kubeconfigprovider "sigs.k8s.io/multicluster-runtime/providers/kubeconfig"
+	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 
 	kamajiv1alpha1 "github.com/clastix/kamaji/api/v1alpha1"
 	cmdutils "github.com/clastix/kamaji/cmd/utils"
@@ -39,6 +42,7 @@ import (
 	"github.com/clastix/kamaji/internal/webhook"
 	"github.com/clastix/kamaji/internal/webhook/handlers"
 	"github.com/clastix/kamaji/internal/webhook/routes"
+	"github.com/clastix/kamaji/internal/constants"
 )
 
 //nolint:maintidx
@@ -61,6 +65,8 @@ func NewCmd(scheme *runtime.Scheme) *cobra.Command {
 		maxConcurrentReconciles       int
 		disableTelemetry              bool
 		certificateExpirationDeadline time.Duration
+		kubeconfigPath 				  string
+		disableWebhook				  bool
 
 		webhookCAPath string
 	)
@@ -82,9 +88,11 @@ func NewCmd(scheme *runtime.Scheme) *cobra.Command {
 			if certificateExpirationDeadline < 24*time.Hour {
 				return fmt.Errorf("certificate expiration deadline must be at least 24 hours")
 			}
-
-			if webhookCABundle, err = os.ReadFile(webhookCAPath); err != nil {
-				return fmt.Errorf("unable to read webhook CA: %w", err)
+			
+			if !disableWebhook {
+				if webhookCABundle, err = os.ReadFile(webhookCAPath); err != nil {
+					return fmt.Errorf("unable to read webhook CA: %w", err)
+				}
 			}
 
 			if err = datastoreutils.CheckExists(context.Background(), scheme, datastore); err != nil {
@@ -119,9 +127,6 @@ func NewCmd(scheme *runtime.Scheme) *cobra.Command {
 				Metrics: metricsserver.Options{
 					BindAddress: metricsBindAddress,
 				},
-				WebhookServer: ctrlwebhook.NewServer(ctrlwebhook.Options{
-					Port: 9443,
-				}),
 				HealthProbeBindAddress:  healthProbeBindAddress,
 				LeaderElection:          leaderElect,
 				LeaderElectionNamespace: managerNamespace,
@@ -133,22 +138,44 @@ func NewCmd(scheme *runtime.Scheme) *cobra.Command {
 				},
 			}
 
-			mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrlOpts)
+			if !disableWebhook {
+				ctrlOpts.WebhookServer = ctrlwebhook.NewServer(ctrlwebhook.Options{Port: 9443})
+			}
+
+			var cfg *rest.Config
+			if kubeconfigPath != "" {
+				var err error
+				cfg, err = clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+				if err != nil {
+					return fmt.Errorf("unable to load kubeconfig %q: %w", kubeconfigPath, err)
+				}
+			} else {
+				cfg = ctrl.GetConfigOrDie()
+			}
+
+			provider := kubeconfigprovider.New(kubeconfigprovider.Options{
+				Namespace: "kamaji-system",
+				KubeconfigSecretLabel: constants.ControlPlaneTargetCluster,
+				KubeconfigSecretKey: "config",
+			})
+			mgr, err := mcmanager.New(cfg, provider, ctrlOpts)
 			if err != nil {
 				setupLog.Error(err, "unable to start manager")
 
 				return err
 			}
 
+			localMgr := mgr.GetLocalManager()
+
 			tcpChannel, certChannel := make(chan event.GenericEvent), make(chan event.GenericEvent)
 
-			if err = (&controllers.DataStore{Client: mgr.GetClient(), TenantControlPlaneTrigger: tcpChannel}).SetupWithManager(mgr); err != nil {
+			if err = (&controllers.DataStore{Client: localMgr.GetClient(), TenantControlPlaneTrigger: tcpChannel}).SetupWithManager(localMgr); err != nil {
 				setupLog.Error(err, "unable to create controller", "controller", "DataStore")
 
 				return err
 			}
 
-			discoveryClient, err := discovery.NewDiscoveryClientForConfig(mgr.GetConfig())
+			discoveryClient, err := discovery.NewDiscoveryClientForConfig(localMgr.GetConfig())
 			if err != nil {
 				setupLog.Error(err, "unable to create discovery client")
 
@@ -156,8 +183,8 @@ func NewCmd(scheme *runtime.Scheme) *cobra.Command {
 			}
 
 			reconciler := &controllers.TenantControlPlaneReconciler{
-				Client:    mgr.GetClient(),
-				APIReader: mgr.GetAPIReader(),
+				Client:    localMgr.GetClient(),
+				APIReader: localMgr.GetAPIReader(),
 				Config: controllers.TenantControlPlaneReconcilerConfig{
 					DefaultDataStoreName:    datastore,
 					KineContainerImage:      kineImage,
@@ -181,7 +208,7 @@ func NewCmd(scheme *runtime.Scheme) *cobra.Command {
 				return err
 			}
 
-			k8sVersion, versionErr := cmdutils.KubernetesVersion(mgr.GetConfig())
+			k8sVersion, versionErr := cmdutils.KubernetesVersion(localMgr.GetConfig())
 			if versionErr != nil {
 				setupLog.Error(err, "unable to get kubernetes version")
 
@@ -189,8 +216,8 @@ func NewCmd(scheme *runtime.Scheme) *cobra.Command {
 			}
 
 			if !disableTelemetry {
-				err = mgr.Add(&controllers.TelemetryController{
-					Client:                  mgr.GetClient(),
+				err = localMgr.Add(&controllers.TelemetryController{
+					Client:                  localMgr.GetClient(),
 					KubernetesVersion:       k8sVersion,
 					KamajiVersion:           internal.GitTag,
 					TelemetryClient:         telemetryClient,
@@ -207,94 +234,96 @@ func NewCmd(scheme *runtime.Scheme) *cobra.Command {
 			certController := &controllers.CertificateLifecycle{Channel: certChannel, Deadline: certificateExpirationDeadline}
 			certController.EnqueueFn = certController.EnqueueForTenantControlPlane
 
-			if err = certController.SetupWithManager(mgr); err != nil {
+			if err = certController.SetupWithManager(localMgr); err != nil {
 				setupLog.Error(err, "unable to create controller", "controller", "CertificateLifecycle")
 
 				return err
 			}
 
-			if err = (&kamajiv1alpha1.DatastoreUsedSecret{}).SetupWithManager(ctx, mgr); err != nil {
+			if err = (&kamajiv1alpha1.DatastoreUsedSecret{}).SetupWithManager(ctx, localMgr); err != nil {
 				setupLog.Error(err, "unable to create indexer", "indexer", "DatastoreUsedSecret")
 
 				return err
 			}
 
-			if err = (&kamajiv1alpha1.TenantControlPlaneStatusDataStore{}).SetupWithManager(ctx, mgr); err != nil {
+			if err = (&kamajiv1alpha1.TenantControlPlaneStatusDataStore{}).SetupWithManager(ctx, localMgr); err != nil {
 				setupLog.Error(err, "unable to create indexer", "indexer", "TenantControlPlaneStatusDataStore")
 
 				return err
 			}
 
 			// Only requires to look for the core api group.
-			if utilities.AreGatewayResourcesAvailable(ctx, mgr.GetClient(), discoveryClient) {
-				if err = (&kamajiv1alpha1.GatewayListener{}).SetupWithManager(ctx, mgr); err != nil {
+			if utilities.AreGatewayResourcesAvailable(ctx, localMgr.GetClient(), discoveryClient) {
+				if err = (&kamajiv1alpha1.GatewayListener{}).SetupWithManager(ctx, localMgr); err != nil {
 					setupLog.Error(err, "unable to create indexer", "indexer", "GatewayListener")
 
 					return err
 				}
 			}
 
-			err = webhook.Register(mgr, map[routes.Route][]handlers.Handler{
-				routes.TenantControlPlaneMigrate{}: {
-					handlers.Freeze{},
-				},
-				routes.TenantControlPlaneWritePermission{}: {
-					handlers.WritePermission{},
-				},
-				routes.TenantControlPlaneDefaults{}: {
-					handlers.TenantControlPlaneDefaults{
-						DefaultDatastore: datastore,
+			if !disableWebhook {
+				err = webhook.Register(localMgr, map[routes.Route][]handlers.Handler{
+					routes.TenantControlPlaneMigrate{}: {
+						handlers.Freeze{},
 					},
-				},
-				routes.TenantControlPlaneValidate{}: {
-					handlers.TenantControlPlaneCertSANs{},
-					handlers.TenantControlPlaneName{},
-					handlers.TenantControlPlaneVersion{},
-					handlers.TenantControlPlaneDataStore{Client: mgr.GetClient()},
-					handlers.TenantControlPlaneDeployment{
-						Client: mgr.GetClient(),
-						DeploymentBuilder: controlplane.Deployment{
-							Client:             mgr.GetClient(),
-							KineContainerImage: kineImage,
-						},
-						KonnectivityBuilder: controlplane.Konnectivity{
-							Scheme: *mgr.GetScheme(),
+					routes.TenantControlPlaneWritePermission{}: {
+						handlers.WritePermission{},
+					},
+					routes.TenantControlPlaneDefaults{}: {
+						handlers.TenantControlPlaneDefaults{
+							DefaultDatastore: datastore,
 						},
 					},
-					handlers.TenantControlPlaneServiceCIDR{},
-					handlers.TenantControlPlaneLoadBalancerSourceRanges{},
-					handlers.TenantControlPlaneGatewayValidation{
-						Client:          mgr.GetClient(),
-						DiscoveryClient: discoveryClient,
+					routes.TenantControlPlaneValidate{}: {
+						handlers.TenantControlPlaneCertSANs{},
+						handlers.TenantControlPlaneName{},
+						handlers.TenantControlPlaneVersion{},
+						handlers.TenantControlPlaneDataStore{Client: localMgr.GetClient()},
+						handlers.TenantControlPlaneDeployment{
+							Client: localMgr.GetClient(),
+							DeploymentBuilder: controlplane.Deployment{
+								Client:             localMgr.GetClient(),
+								KineContainerImage: kineImage,
+							},
+							KonnectivityBuilder: controlplane.Konnectivity{
+								Scheme: *localMgr.GetScheme(),
+							},
+						},
+						handlers.TenantControlPlaneServiceCIDR{},
+						handlers.TenantControlPlaneLoadBalancerSourceRanges{},
+						handlers.TenantControlPlaneGatewayValidation{
+							Client:          localMgr.GetClient(),
+							DiscoveryClient: discoveryClient,
+						},
 					},
-				},
-				routes.TenantControlPlaneTelemetry{}: {
-					handlers.TenantControlPlaneTelemetry{
-						Enabled:           !disableTelemetry,
-						TelemetryClient:   telemetryClient,
-						KamajiVersion:     internal.GitTag,
-						KubernetesVersion: k8sVersion,
+					routes.TenantControlPlaneTelemetry{}: {
+						handlers.TenantControlPlaneTelemetry{
+							Enabled:           !disableTelemetry,
+							TelemetryClient:   telemetryClient,
+							KamajiVersion:     internal.GitTag,
+							KubernetesVersion: k8sVersion,
+						},
 					},
-				},
-				routes.DataStoreValidate{}: {
-					handlers.DataStoreValidation{Client: mgr.GetClient()},
-				},
-				routes.DataStoreSecrets{}: {
-					handlers.DataStoreSecretValidation{Client: mgr.GetClient()},
-				},
-			})
-			if err != nil {
-				setupLog.Error(err, "unable to create webhook")
+					routes.DataStoreValidate{}: {
+						handlers.DataStoreValidation{Client: localMgr.GetClient()},
+					},
+					routes.DataStoreSecrets{}: {
+						handlers.DataStoreSecretValidation{Client: localMgr.GetClient()},
+					},
+				})
+				if err != nil {
+					setupLog.Error(err, "unable to create webhook")
 
-				return err
+					return err
+				}
 			}
 
 			if err = (&soot.Manager{
 				MigrateCABundle:         webhookCABundle,
 				MigrateServiceName:      managerServiceName,
 				MigrateServiceNamespace: managerNamespace,
-				AdminClient:             mgr.GetClient(),
-			}).SetupWithManager(mgr); err != nil {
+				AdminClient:             localMgr.GetClient(),
+			}).SetupWithManager(localMgr); err != nil {
 				setupLog.Error(err, "unable to set up soot manager")
 
 				return err
@@ -347,6 +376,8 @@ func NewCmd(scheme *runtime.Scheme) *cobra.Command {
 	cmd.Flags().DurationVar(&cacheResyncPeriod, "cache-resync-period", 10*time.Hour, "The controller-runtime.Manager cache resync period.")
 	cmd.Flags().BoolVar(&disableTelemetry, "disable-telemetry", false, "Disable the analytics traces collection.")
 	cmd.Flags().DurationVar(&certificateExpirationDeadline, "certificate-expiration-deadline", 24*time.Hour, "Define the deadline upon certificate expiration to start the renewal process, cannot be less than a 24 hours.")
+	cmd.Flags().StringVar(&kubeconfigPath, "kubeconfig", "", "Path to kubeconfig (defaults to $KUBECONFIG)")
+	cmd.Flags().BoolVar(&disableWebhook, "disable-webhook", false, "Disable the webhook server and registration")
 
 	cobra.OnInitialize(func() {
 		viper.AutomaticEnv()
