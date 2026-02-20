@@ -233,7 +233,8 @@ type KubernetesDeploymentStatus struct {
 
 // KubernetesServiceStatus defines the status for the Tenant Control Plane Service in the management cluster.
 type KubernetesServiceStatus struct {
-	corev1.ServiceStatus `json:",inline"`
+	// The address of the Service for the given cluster.
+	Address string `json:"address"`
 	// The name of the Service for the given cluster.
 	Name string `json:"name"`
 	// The namespace which the Service for the given cluster is deployed.
