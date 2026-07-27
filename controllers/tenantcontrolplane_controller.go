@@ -17,6 +17,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/discovery"
@@ -283,24 +284,36 @@ func (r *TenantControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 
 	log.Info(fmt.Sprintf("%s has been reconciled", tenantControlPlane.GetName()))
 
-	// Set ObservedGeneration only on successful reconciliation completion.
-	// This follows Cluster API conventions where ObservedGeneration indicates
-	// the controller has fully processed the given generation.
-	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		if getErr := r.Client.Get(ctx, req.NamespacedName, tenantControlPlane); getErr != nil {
-			return getErr
-		}
-
-		tenantControlPlane.Status.ObservedGeneration = tenantControlPlane.Generation
-
-		return r.Client.Status().Update(ctx, tenantControlPlane)
-	}); err != nil {
+	if err := r.updateObservedGeneration(ctx, req.NamespacedName, tenantControlPlane); err != nil {
 		log.Error(err, "failed to update ObservedGeneration")
 
 		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// updateObservedGeneration sets ObservedGeneration only on successful reconciliation completion.
+// This follows Cluster API conventions where ObservedGeneration indicates the controller has
+// fully processed the given generation.
+func (r *TenantControlPlaneReconciler) updateObservedGeneration(ctx context.Context, namespacedName k8stypes.NamespacedName, tenantControlPlane *kamajiv1alpha1.TenantControlPlane) error {
+	if tenantControlPlane.Status.ObservedGeneration == tenantControlPlane.Generation {
+		return nil
+	}
+
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if getErr := r.Client.Get(ctx, namespacedName, tenantControlPlane); getErr != nil {
+			return getErr
+		}
+
+		if tenantControlPlane.Status.ObservedGeneration == tenantControlPlane.Generation {
+			return nil
+		}
+
+		tenantControlPlane.Status.ObservedGeneration = tenantControlPlane.Generation
+
+		return r.Client.Status().Update(ctx, tenantControlPlane)
+	})
 }
 
 func (r *TenantControlPlaneReconciler) mutexSpec(obj client.Object) mutex.Spec {
@@ -347,10 +360,14 @@ func (r *TenantControlPlaneReconciler) SetupWithManager(ctx context.Context, mgr
 				},
 			})
 		}})).
-		For(&kamajiv1alpha1.TenantControlPlane{}).
+		For(&kamajiv1alpha1.TenantControlPlane{}, builder.WithPredicates(predicate.Or(
+			predicate.GenerationChangedPredicate{},
+			predicate.AnnotationChangedPredicate{},
+			predicate.LabelChangedPredicate{},
+		))).
 		Owns(&corev1.Secret{}).
 		Owns(&corev1.ConfigMap{}).
-		Owns(&appsv1.Deployment{}).
+		Owns(&appsv1.Deployment{}, builder.WithPredicates(deploymentStatusChangedPredicate())).
 		Owns(&corev1.Service{}).
 		Owns(&networkingv1.Ingress{}).
 		Watches(&batchv1.Job{}, handler.EnqueueRequestsFromMapFunc(func(_ context.Context, object client.Object) []reconcile.Request {
@@ -398,6 +415,28 @@ func (r *TenantControlPlaneReconciler) SetupWithManager(ctx context.Context, mgr
 			MaxConcurrentReconciles: r.MaxConcurrentReconciles,
 		}).
 		Complete(r)
+}
+
+// deploymentStatusChangedPredicate lets a Deployment UpdateEvent through only when a field consumed
+// by KubernetesDeploymentResource has changed, filtering out non-substantive status churn
+// (e.g. condition timestamp refreshes) that would otherwise trigger a needless TCP reconciliation.
+func deploymentStatusChangedPredicate() predicate.Funcs {
+	return predicate.Funcs{
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldDeployment, okOld := e.ObjectOld.(*appsv1.Deployment)
+			newDeployment, okNew := e.ObjectNew.(*appsv1.Deployment)
+			if !okOld || !okNew {
+				return true
+			}
+
+			return oldDeployment.Status.ReadyReplicas != newDeployment.Status.ReadyReplicas ||
+				oldDeployment.Status.Replicas != newDeployment.Status.Replicas ||
+				oldDeployment.Status.UpdatedReplicas != newDeployment.Status.UpdatedReplicas ||
+				oldDeployment.Status.UnavailableReplicas != newDeployment.Status.UnavailableReplicas ||
+				oldDeployment.Status.ObservedGeneration != newDeployment.Status.ObservedGeneration ||
+				!equality.Semantic.DeepEqual(oldDeployment.Spec, newDeployment.Spec)
+		},
+	}
 }
 
 func (r *TenantControlPlaneReconciler) refreshTenantControlPlaneMetrics(ctx context.Context) error {
